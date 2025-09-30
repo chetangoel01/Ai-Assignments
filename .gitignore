@@ -184,3 +184,6 @@ datasets/*
 install/
 log/
 .colcon/
+
+.DS_Store
+.vscode/
