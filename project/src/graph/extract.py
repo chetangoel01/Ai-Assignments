@@ -1,17 +1,23 @@
 """
-Modal-based entity extraction using vLLM on A100-80GB GPU.
+Modal-based entity extraction using vLLM on A100-80GB GPUs.
 
 Uses Qwen3-32B for extraction with thinking mode DISABLED for clean JSON output.
+PARALLELIZED across multiple GPUs using Modal's .map() for 10x speedup.
+
+Extracts: concepts, relations, AND examples (worked examples, code, math derivations)
 
 Usage:
     # First, export chunks from MongoDB to JSON
     python export_chunks.py
     
-    # Run extraction on Modal
+    # Run extraction on Modal (uses 10 parallel GPUs by default)
     modal run extract.py --input chunks.json --output extractions.json
     
     # For testing with a small batch
     modal run extract.py --input chunks.json --output extractions.json --max-chunks 100
+    
+    # Adjust parallelism
+    modal run extract.py --input chunks.json --output extractions.json --num-gpus 5
 """
 
 import modal
@@ -38,78 +44,94 @@ vllm_image = (
 
 
 # =============================================================================
-# Extraction Prompt (System + User)
+# Extraction Prompt (System + User) - NOW INCLUDES EXAMPLES
 # =============================================================================
 
 SYSTEM_PROMPT = """You are an expert at extracting AI/ML concepts from educational content.
 You always respond with valid JSON only, no markdown, no explanations, no thinking."""
 
-USER_PROMPT_TEMPLATE = """Extract AI/ML concepts and their relationships from this educational text.
+USER_PROMPT_TEMPLATE = """Extract AI/ML concepts, their relationships, and worked examples from this educational text.
 
-For each concept, provide:
+For each CONCEPT, provide:
 - title: The canonical name (e.g., "Gradient Descent")
 - definition: A brief 1-2 sentence definition
 - difficulty: "beginner", "intermediate", or "advanced"
 - aliases: Alternative names as a list
 
-For relations between concepts found:
+For RELATIONS between concepts found:
 - prereq_of: Concept A must be understood before Concept B
 - is_a: Concept A is a type of Concept B (e.g., "CNN is_a Neural Network")
 - part_of: Concept A is a component of Concept B
 - contrasts_with: Concepts that are alternatives or opposites
 - sibling: Concepts at the same level
 
+For EXAMPLES (worked examples, code snippets, mathematical derivations, case studies):
+- text: Brief description of the example (1-2 sentences)
+- concept: Which concept this example demonstrates (must match a concept title exactly)
+- example_type: One of "code", "math", "case_study", "walkthrough", "diagram"
+
 IMPORTANT:
 - Only extract concepts actually discussed in the text
-- Use exact concept titles from your extracted concepts in relations
-- Return ONLY valid JSON, no markdown code blocks, no explanations
+- Examples should be concrete illustrations, not just mentions
+- Use exact concept titles in relations and examples
+- Return ONLY valid JSON, no markdown code blocks
 
 Return format:
-{{"concepts": [{{"title": "...", "definition": "...", "difficulty": "...", "aliases": []}}], "relations": [{{"source": "...", "target": "...", "relation_type": "..."}}]}}
+{{"concepts": [{{"title": "...", "definition": "...", "difficulty": "...", "aliases": []}}], "relations": [{{"source": "...", "target": "...", "relation_type": "..."}}], "examples": [{{"text": "...", "concept": "...", "example_type": "..."}}]}}
 
-If no AI/ML concepts found: {{"concepts": [], "relations": []}}
+If nothing found: {{"concepts": [], "relations": [], "examples": []}}
 
 TEXT:
 {text}"""
 
 
 # =============================================================================
-# vLLM Model Class
+# vLLM Model Class - Each instance runs on its own GPU
 # =============================================================================
 
 @app.cls(
-    gpu=modal.gpu.A100(size="80GB"),
+    gpu="A100-80GB",
     image=vllm_image,
     timeout=3600,  # 1 hour max
-    container_idle_timeout=300,  # Keep warm for 5 min
+    scaledown_window=300,  # Keep warm for 5 min
 )
 class Extractor:
-    """vLLM-based extraction using Qwen3-32B with thinking disabled."""
+    """vLLM-based extraction using Qwen3-32B with thinking disabled.
+    
+    Modal will spin up multiple containers (each with its own A100 GPU)
+    to process batches in parallel.
+    """
     
     model_name: str = "Qwen/Qwen3-32B"
     
     @modal.enter()
     def load_model(self):
         """Load vLLM model on container start."""
+        import time
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
         
-        print(f"Loading {self.model_name}...")
+        start_time = time.time()
+        print(f"[{time.time() - start_time:.1f}s] Starting to load {self.model_name}...")
         
         # Load tokenizer for chat template
+        print(f"[{time.time() - start_time:.1f}s] Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name, 
             trust_remote_code=True
         )
+        print(f"[{time.time() - start_time:.1f}s] Tokenizer loaded")
         
         # Load vLLM engine
+        print(f"[{time.time() - start_time:.1f}s] Loading vLLM engine (this may take 5-10 min on first run)...")
+        print(f"[{time.time() - start_time:.1f}s] Downloading/loading model weights (~60GB)...")
         self.llm = LLM(
             model=self.model_name,
             tensor_parallel_size=1,
             dtype="bfloat16",
             max_model_len=8192,
             gpu_memory_utilization=0.90,
-            trust_remote_code=True,
+            seed=0,  # Explicit seed to avoid deprecation warning
         )
         
         # Sampling params for non-thinking mode (lower temperature for structured output)
@@ -120,7 +142,8 @@ class Extractor:
             max_tokens=2048,
             stop=["```", "\n\n\n"],
         )
-        print("Model loaded!")
+        elapsed = time.time() - start_time
+        print(f"[{elapsed:.1f}s] Model loaded successfully! ({elapsed/60:.1f} minutes)")
     
     def _build_prompt(self, text: str) -> str:
         """Build chat prompt with thinking DISABLED."""
@@ -142,7 +165,7 @@ class Extractor:
     @modal.method()
     def extract_batch(self, chunks: list[dict]) -> list[dict]:
         """
-        Extract concepts and relations from a batch of chunks.
+        Extract concepts, relations, and examples from a batch of chunks.
         
         Args:
             chunks: List of chunk dicts with 'chunk_id', 'text', 'source_url'
@@ -166,6 +189,7 @@ class Extractor:
                 "source_url": chunk.get("source_url", ""),
                 "concepts": [],
                 "relations": [],
+                "examples": [],  # NEW: examples field
                 "error": None,
             }
             
@@ -206,15 +230,28 @@ class Extractor:
                         if brace_count == 0:
                             json_end = i + 1
                             break
-                
                 if json_end > 0:
                     raw_text = raw_text[:json_end]
                 
+                # Parse JSON
                 parsed = json.loads(raw_text)
-                result["concepts"] = parsed.get("concepts", [])
-                result["relations"] = parsed.get("relations", [])
-                result["raw_response"] = raw_text
                 
+                concepts = parsed.get("concepts", [])
+                relations = parsed.get("relations", [])
+                examples = parsed.get("examples", [])  # NEW: extract examples
+                
+                # Basic validation
+                if not isinstance(concepts, list):
+                    raise ValueError("concepts is not a list")
+                if not isinstance(relations, list):
+                    raise ValueError("relations is not a list")
+                if not isinstance(examples, list):
+                    examples = []  # Default to empty if not a list
+                
+                result["concepts"] = concepts
+                result["relations"] = relations
+                result["examples"] = examples  # NEW: include examples
+            
             except json.JSONDecodeError as e:
                 result["error"] = f"JSON parse error: {str(e)}"
                 result["raw_response"] = output.outputs[0].text[:500]
@@ -227,7 +264,7 @@ class Extractor:
 
 
 # =============================================================================
-# Local Entry Point
+# Local Entry Point - Parallel Processing
 # =============================================================================
 
 @app.local_entrypoint()
@@ -236,76 +273,106 @@ def main(
     output: str = "extractions.json",
     batch_size: int = 32,
     max_chunks: Optional[int] = None,
+    num_gpus: int = 10,
 ):
     """
-    Run extraction on all chunks.
-    
+    Run extraction on all chunks using PARALLEL GPU workers.
+
     Args:
         input: Path to JSON file with chunks
         output: Path to save extraction results
-        batch_size: Number of chunks per batch (affects GPU memory)
+        batch_size: Number of chunks per batch per GPU
         max_chunks: Limit number of chunks for testing
+        num_gpus: Number of parallel GPU workers (default: 10)
     """
     import time
-    
+
     # Load chunks
     print(f"Loading chunks from {input}...")
-    with open(input) as f:
+    with open(input, "r") as f:
         chunks = json.load(f)
-    
+
+    if not isinstance(chunks, list):
+        raise ValueError("Input JSON must be a list of chunk objects")
+
     total_chunks = len(chunks)
-    if max_chunks:
+    if max_chunks is not None:
         chunks = chunks[:max_chunks]
         print(f"Limited to {max_chunks} chunks (test mode)")
-    
-    print(f"Processing {len(chunks)} chunks in batches of {batch_size}...")
-    print(f"Using Qwen3-32B with thinking DISABLED")
-    
-    # Initialize extractor
-    extractor = Extractor()
-    
-    all_results = []
-    start_time = time.time()
-    
-    # Process in batches
-    num_batches = (len(chunks) + batch_size - 1) // batch_size
+
+    print(f"\n{'='*60}")
+    print("PARALLEL EXTRACTION CONFIG")
+    print(f"{'='*60}")
+    print(f"Total chunks:    {len(chunks)} (of {total_chunks} available)")
+    print(f"Batch size:      {batch_size} chunks/batch")
+    print(f"Parallel GPUs:   {num_gpus}")
+    print(f"Model:           Qwen3-32B (thinking disabled)")
+    print(f"Extracting:      concepts, relations, AND examples")
+    print(f"{'='*60}\n")
+
+    # Split into batches
+    batches: list[list[dict]] = []
     for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        batch_num = i // batch_size + 1
-        
-        print(f"  Batch {batch_num}/{num_batches} ({len(batch)} chunks)...")
-        batch_start = time.time()
-        
-        results = extractor.extract_batch.remote(batch)
-        all_results.extend(results)
-        
-        batch_time = time.time() - batch_start
-        chunks_per_sec = len(batch) / batch_time if batch_time > 0 else 0
-        print(f"    Done in {batch_time:.1f}s ({chunks_per_sec:.1f} chunks/sec)")
-    
+        batches.append(chunks[i : i + batch_size])
+
+    print(f"Created {len(batches)} batches")
+    print(f"Processing with up to {num_gpus} parallel GPU workers...\n")
+
+    extractor = Extractor()
+    start_time = time.time()
+    all_results: list[dict] = []
+
+    # Process batches in windows of size num_gpus to cap parallelism
+    for window_start in range(0, len(batches), num_gpus):
+        window = batches[window_start : window_start + num_gpus]
+
+        # Each batch in the window is sent as a separate .map task
+        for result_batch in extractor.extract_batch.map(window, order_outputs=False):
+            all_results.extend(result_batch)
+
+            # Progress logging
+            elapsed = time.time() - start_time
+            chunks_done = len(all_results)
+            rate = chunks_done / elapsed if elapsed > 0 else 0.0
+            remaining = len(chunks) - chunks_done
+            eta = remaining / rate if rate > 0 else 0.0
+
+            print(
+                f"  Progress: {chunks_done}/{len(chunks)} "
+                f"({100 * chunks_done / len(chunks):.1f}%) | "
+                f"{rate:.1f} chunks/sec | ETA: {eta:.0f}s"
+            )
+
     # Save results
     print(f"\nSaving results to {output}...")
     with open(output, "w") as f:
         json.dump(all_results, f, indent=2)
-    
-    # Summary
+
+    # Summary - NOW INCLUDES EXAMPLES
     elapsed = time.time() - start_time
     n_concepts = sum(len(r.get("concepts", [])) for r in all_results)
     n_relations = sum(len(r.get("relations", [])) for r in all_results)
+    n_examples = sum(len(r.get("examples", [])) for r in all_results)
     n_errors = sum(1 for r in all_results if r.get("error"))
-    
+
     print(f"\n{'='*60}")
-    print(f"EXTRACTION COMPLETE")
+    print("EXTRACTION COMPLETE")
     print(f"{'='*60}")
-    print(f"Time:      {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-    print(f"Chunks:    {len(all_results)}")
-    print(f"Concepts:  {n_concepts}")
-    print(f"Relations: {n_relations}")
-    print(f"Errors:    {n_errors} ({100*n_errors/len(all_results):.1f}%)")
-    print(f"Output:    {output}")
-    
+    print(f"Time:       {elapsed/60:.1f} min")
+    print(f"Throughput: {len(all_results)/elapsed:.1f} chunks/sec")
+    print(f"Chunks:     {len(all_results)}")
+    print(f"Concepts:   {n_concepts}")
+    print(f"Relations:  {n_relations}")
+    print(f"Examples:   {n_examples}")  # NEW
+    print(f"Errors:     {n_errors} ({100*n_errors/len(all_results):.1f}%)")
+    print(f"Output:     {output}")
+    print(
+        f"\nCost estimate: ~${elapsed/3600 * 3.50 * num_gpus:.2f} "
+        f"({num_gpus} GPUs @ $3.50/hr)"
+    )
+
     if n_errors > 0:
-        print(f"\nSample errors:")
+        print("\nSample errors:")
         error_count = 0
         for r in all_results:
             if r.get("error") and error_count < 5:

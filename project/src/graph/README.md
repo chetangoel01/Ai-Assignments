@@ -1,14 +1,15 @@
 # Modal-based Entity Extraction for Erica
 
-This pipeline extracts AI/ML concepts and relationships from your course chunks using Modal's A100-80GB GPUs with vLLM for fast parallel inference.
+This pipeline extracts AI/ML concepts and relationships from your course chunks using Modal's A100-80GB GPUs with vLLM for fast **parallel** inference.
 
 ## Overview
 
-**Model**: Qwen3-32B (with thinking mode disabled for clean JSON output)
+**Model**: Qwen3-32B (with thinking mode disabled for clean JSON output)  
+**Parallelism**: 10 GPUs by default (configurable)
 
 The pipeline:
 1. **Export** chunks from MongoDB to JSON
-2. **Process** on Modal with Qwen3-32B via vLLM
+2. **Process** on Modal with Qwen3-32B via vLLM (10 parallel GPUs)
 3. **Import** results back into MongoDB
 
 ## Prerequisites
@@ -40,13 +41,16 @@ This creates `chunks.json`.
 ### 2. Run extraction on Modal
 
 ```bash
-# Full run (all chunks)
+# Full run with 10 parallel GPUs (default)
 modal run extract.py --input chunks.json --output extractions.json
 
-# Test run (100 chunks)
-modal run extract.py --input chunks.json --output extractions.json --max-chunks 100
+# Test run (100 chunks, fewer GPUs)
+modal run extract.py --input chunks.json --output extractions.json --max-chunks 100 --num-gpus 2
 
-# Adjust batch size if OOM (default: 32)
+# Adjust parallelism (use more GPUs for faster processing)
+modal run extract.py --input chunks.json --output extractions.json --num-gpus 10
+
+# Adjust batch size per GPU
 modal run extract.py --input chunks.json --output extractions.json --batch-size 16
 ```
 
@@ -60,13 +64,21 @@ python import_extractions.py extractions.json
 python import_extractions.py extractions.json --clear
 ```
 
-## Cost Estimate
+## Cost & Time Estimates
 
-Modal pricing for A100-80GB: ~$3.50/hour
+Modal pricing for A100-80GB: ~$3.50/hour/GPU
 
-For ~9,000 chunks:
-- Qwen3-32B on A100-80GB: ~20-30 minutes
-- **Estimated cost: $1.50-2.00**
+For ~9,000 chunks with **10 parallel GPUs**:
+- Time: ~3-5 minutes (vs 30 min with 1 GPU)
+- Cost: ~$2-3 (10 GPUs × 5 min × $3.50/hr)
+
+| GPUs | Estimated Time | Estimated Cost |
+|------|----------------|----------------|
+| 1    | 25-30 min      | $1.50-2.00     |
+| 5    | 5-7 min        | $1.50-2.00     |
+| 10   | 3-5 min        | $2.00-3.00     |
+
+Note: More GPUs = faster but slightly higher cost due to startup overhead.
 
 ## Why Qwen3-32B?
 
